@@ -562,8 +562,7 @@ def build_agent_plan(user_text: str, model_name: str) -> dict:
     logger.info("Gerando plano do agente", extra={"model": model_name})
     system = """
 Voce eh um roteador de acoes financeiras.
-Responda APENAS um JSON valido, sem texto fora do JSON.
-Use EXATAMENTE este schema:
+Responda SOMENTE JSON valido no formato:
 {
   "action": "add_income|add_expense|remove_transaction|get_report|clarify",
   "arguments": {
@@ -578,9 +577,14 @@ Use EXATAMENTE este schema:
   "message": "frase curta em portugues",
   "requires_confirmation": boolean
 }
-Categorias receita: salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas.
-Categorias despesa: alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos.
-Se faltar dado essencial, retorne action="clarify".
+Use "clarify" quando faltar dado essencial.
+Categorias permitidas para receita (add_income):
+salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas
+Categorias permitidas para despesa (add_expense):
+alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos
+Sempre retorne category em um desses valores exatos.
+Nunca invente categoria, nunca responda texto livre em "category".
+Se nao for possivel classificar com seguranca em uma categoria permitida, use action="clarify".
 """
     raw = run_ollama(
         messages=[
