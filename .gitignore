@@ -6,3 +6,5 @@ __pycache__/
 
 /generated/prisma
 .wwebjs_auth/
+.wwebjs_cache/
+whatsapp-qr.png

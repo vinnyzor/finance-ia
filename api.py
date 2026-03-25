@@ -713,14 +713,16 @@ Responda SOMENTE JSON valido no formato:
   "message": "frase curta em portugues",
   "requires_confirmation": boolean
 }
-Use "clarify" quando faltar dado essencial.
-Categorias permitidas para receita (add_income):
-salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas
-Categorias permitidas para despesa (add_expense):
-alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos
-Sempre retorne category em um desses valores exatos.
-Nunca invente categoria, nunca responda texto livre em "category".
-Se nao for possivel classificar com seguranca em uma categoria permitida, use action="clarify".
+
+REGRA CRITICA - campo arguments.category:
+- Para add_income ou add_expense, "category" DEVE ser EXATAMENTE UMA destas strings (copie literal, minusculas, sem acento, sem espaco, underscore onde indicado):
+  RECEITA: salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas
+  DESPESA: alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos
+- PROIBIDO usar como category: objeto do gasto (ex.: "carro", "gasolina", "ifood", "uber"), sinonimo, plural errado, ou qualquer palavra fora da lista acima.
+- Se o usuario falar de algo que nao encaixa com seguranca em UMA categoria da lista, use action="clarify" e explique na "message" qual categoria ele deve escolher (citando 2-3 opcoes da lista).
+
+Use "clarify" quando faltar dado essencial (ex.: valor) ou quando nao der para mapear com seguranca para uma unica categoria permitida.
+Nunca invente categoria fora da lista. Nunca coloque texto livre em "category".
 """
     raw = run_ollama(
         messages=[
