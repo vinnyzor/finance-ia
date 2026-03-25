@@ -25,8 +25,15 @@ logging.basicConfig(
 logger = logging.getLogger("finance_api")
 
 
-MODEL_NAME = "base"
-OLLAMA_MODEL = "llama3.2:3b"
+MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "140"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "1024"))
+OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "4"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
 INCOME_CATEGORIES = {
     "salario",
@@ -362,24 +369,30 @@ def run_ollama(messages: list[dict], model_name: str) -> str:
         "model": model_name,
         "messages": messages,
         "stream": False,
-        "options": {"temperature": 0.1},
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+            "num_predict": OLLAMA_NUM_PREDICT,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_thread": OLLAMA_NUM_THREAD,
+        },
     }
     req = request.Request(
-        url="http://127.0.0.1:11434/api/chat",
+        url=f"{OLLAMA_BASE_URL}/api/chat",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with request.urlopen(req, timeout=120) as response:
+        with request.urlopen(req, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read().decode("utf-8"))
             return (body.get("message", {}) or {}).get("content", "").strip()
     except error.URLError as exc:
         raise HTTPException(
             status_code=500,
             detail=(
-                "Nao foi possivel conectar no Ollama local. "
-                "Execute `ollama serve` e `ollama pull llama3.2:3b`."
+                "Nao foi possivel conectar no Ollama. "
+                f"Verifique OLLAMA_BASE_URL ({OLLAMA_BASE_URL}), `ollama serve` e `ollama pull` do modelo."
             ),
         ) from exc
 
@@ -551,6 +564,17 @@ def execute_agent_text(
 
 @app.on_event("startup")
 def startup_event() -> None:
+    logger.info(
+        "Modelos carregados",
+        extra={
+            "whisper_model": MODEL_NAME,
+            "ollama_model": OLLAMA_MODEL,
+            "ollama_base_url": OLLAMA_BASE_URL,
+            "ollama_num_predict": OLLAMA_NUM_PREDICT,
+            "ollama_num_ctx": OLLAMA_NUM_CTX,
+            "ollama_num_thread": OLLAMA_NUM_THREAD,
+        },
+    )
     init_db()
     logger.info("API pronta para receber requisicoes.")
 
