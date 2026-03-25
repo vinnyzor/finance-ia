@@ -387,7 +387,7 @@ def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -
             "json_mode": json_mode,
         },
     )
-    if DEBUG_PAYLOADS:
+    if DEBUG_PAYLOADS or OLLAMA_DEBUG_STREAM:
         # Evita logar prompt enorme; mostramos só preview.
         system_preview = ""
         user_preview = ""
@@ -466,7 +466,7 @@ def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -
                                 "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
                             },
                         )
-                        if DEBUG_PAYLOADS and chunks:
+                        if (DEBUG_PAYLOADS or OLLAMA_DEBUG_STREAM) and chunks:
                             logger.info(
                                 "Ollama resposta (preview)",
                                 extra={
@@ -490,7 +490,7 @@ def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -
                 },
             )
             content = (body.get("message", {}) or {}).get("content", "").strip()
-            if DEBUG_PAYLOADS:
+            if (DEBUG_PAYLOADS or OLLAMA_DEBUG_STREAM):
                 logger.info(
                     "Ollama resposta (preview)",
                     extra={
