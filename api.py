@@ -374,7 +374,7 @@ def run_transcription(audio_bytes: bytes, suffix: str) -> str:
             Path(temp_path).unlink(missing_ok=True)
 
 
-def run_ollama(messages: list[dict], model_name: str) -> str:
+def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -> str:
     payload = {
         "model": model_name,
         "messages": messages,
@@ -387,6 +387,8 @@ def run_ollama(messages: list[dict], model_name: str) -> str:
             "num_thread": OLLAMA_NUM_THREAD,
         },
     }
+    if json_mode:
+        payload["format"] = "json"
     req = request.Request(
         url=f"{OLLAMA_BASE_URL}/api/chat",
         data=json.dumps(payload).encode("utf-8"),
@@ -442,30 +444,22 @@ def parse_agent_plan(raw: str) -> dict:
 def build_agent_plan(user_text: str, model_name: str) -> dict:
     logger.info("Gerando plano do agente", extra={"model": model_name})
     system = """
-Voce eh um roteador de acoes financeiras.
-Responda SOMENTE JSON valido no formato:
-{
-  "action": "add_income|add_expense|remove_transaction|get_report|clarify",
-  "arguments": {
-    "amount": number|null,
-    "category": string|null,
-    "description": string|null,
-    "occurred_on": "YYYY-MM-DD"|null,
-    "transaction_id": integer|null,
-    "period": "day|week|month"|null,
-    "report_kind": "income|expense|all"|null
-  },
-  "message": "frase curta em portugues",
-  "requires_confirmation": boolean
-}
-Use "clarify" quando faltar dado essencial.
-Categorias permitidas para receita (add_income):
-salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas
-Categorias permitidas para despesa (add_expense):
-alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos
-Sempre retorne category em um desses valores exatos.
-Nunca invente categoria, nunca responda texto livre em "category".
-Se nao for possivel classificar com seguranca em uma categoria permitida, use action="clarify".
+Responda APENAS JSON valido.
+Campos obrigatorios:
+- action: add_income|add_expense|remove_transaction|get_report|clarify
+- arguments: objeto com amount, category, description, occurred_on, transaction_id, period, report_kind
+- message: frase curta em portugues
+- requires_confirmation: boolean
+
+Regras:
+- Se faltar dado essencial, action="clarify".
+- Periodo permitido: day|week|month.
+- Report kind permitido: income|expense|all.
+- Para add_income, category deve ser uma de:
+  salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas
+- Para add_expense, category deve ser uma de:
+  alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos
+- Nunca invente categoria fora da lista.
 """
     raw = run_ollama(
         messages=[
@@ -473,6 +467,7 @@ Se nao for possivel classificar com seguranca em uma categoria permitida, use ac
             {"role": "user", "content": user_text},
         ],
         model_name=model_name,
+        json_mode=True,
     )
     return parse_agent_plan(raw)
 
