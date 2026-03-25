@@ -14,6 +14,9 @@ const ALLOWED_GROUP_IDS = (process.env.ALLOWED_GROUP_IDS || "")
   .map((id) => id.trim())
   .filter(Boolean);
 const DEBUG_LOGS = (process.env.DEBUG_LOGS || "true").toLowerCase() === "true";
+const ACK_MESSAGE =
+  process.env.ACK_MESSAGE ||
+  "Oba! Vou registrar seu pedido agora. Só um instante...";
 const processedMessageIds = new Set();
 
 function logDebug(...args) {
@@ -91,6 +94,11 @@ async function sendAudioToAgent(media, phone) {
       status: response.status,
       ok: response.data?.agent_result?.ok,
       action: response.data?.agent_result?.action,
+    });
+    // Payload completo enviado/retornado pela IA (transcricao + resultado do agente)
+    logDebug("Payload (transcribe-and-agent)", {
+      transcription: response.data?.transcription,
+      agent_result: response.data?.agent_result,
     });
     return response.data;
   } finally {
@@ -193,6 +201,8 @@ async function handleIncomingMessage(message, sourceEvent) {
         await message.reply("Nao consegui baixar o audio.");
         return;
       }
+      // Retorno imediato para o usuário enquanto a API/LLM processa.
+      await message.reply(ACK_MESSAGE);
       const payload = await sendAudioToAgent(media, phone);
       const text = payload?.transcription ? `Transcricao: ${payload.transcription}\n\n` : "";
       logDebug("Enviando resposta ao grupo", {
