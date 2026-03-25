@@ -37,6 +37,7 @@ OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "2"))
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 OLLAMA_DEBUG_STREAM = os.getenv("OLLAMA_DEBUG_STREAM", "false").lower() == "true"
+DEBUG_PAYLOADS = os.getenv("DEBUG_PAYLOADS", "false").lower() == "true"
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
 INCOME_CATEGORIES = {
     "salario",
@@ -386,6 +387,30 @@ def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -
             "json_mode": json_mode,
         },
     )
+    if DEBUG_PAYLOADS:
+        # Evita logar prompt enorme; mostramos só preview.
+        system_preview = ""
+        user_preview = ""
+        for m in messages:
+            if m.get("role") == "system":
+                system_preview = (m.get("content") or "")[:300]
+            if m.get("role") == "user":
+                user_preview = (m.get("content") or "")[:300]
+        logger.info(
+            "Ollama payload (preview)",
+            extra={
+                "model": model_name,
+                "messages_roles": [m.get("role") for m in messages],
+                "system_preview": system_preview,
+                "user_preview": user_preview,
+                "options": {
+                    "temperature": OLLAMA_TEMPERATURE,
+                    "num_predict": OLLAMA_NUM_PREDICT,
+                    "num_ctx": OLLAMA_NUM_CTX,
+                    "num_thread": OLLAMA_NUM_THREAD,
+                },
+            },
+        )
     payload = {
         "model": model_name,
         "messages": messages,
@@ -441,6 +466,14 @@ def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -
                                 "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
                             },
                         )
+                        if DEBUG_PAYLOADS and chunks:
+                            logger.info(
+                                "Ollama resposta (preview)",
+                                extra={
+                                    "response_preview": "".join(chunks)[:300],
+                                    "response_len": len("".join(chunks)),
+                                },
+                            )
                         break
                 return "".join(chunks).strip()
 
@@ -456,7 +489,16 @@ def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -
                     "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
                 },
             )
-            return (body.get("message", {}) or {}).get("content", "").strip()
+            content = (body.get("message", {}) or {}).get("content", "").strip()
+            if DEBUG_PAYLOADS:
+                logger.info(
+                    "Ollama resposta (preview)",
+                    extra={
+                        "response_preview": content[:300],
+                        "response_len": len(content),
+                    },
+                )
+            return content
     except TimeoutError as exc:
         logger.exception("Timeout ao chamar Ollama")
         raise HTTPException(
@@ -806,6 +848,16 @@ def finance_categories() -> dict:
 @app.post("/api/agent/execute")
 def agent_execute(request_body: AgentExecuteRequest) -> dict:
     logger.info("Endpoint /api/agent/execute", extra={"phone": normalize_phone(request_body.phone)})
+    if DEBUG_PAYLOADS:
+        logger.info(
+            "agent/execute request (preview)",
+            extra={
+                "text_preview": (request_body.text or "")[:300],
+                "confirm": request_body.confirm,
+                "model": request_body.model or OLLAMA_MODEL,
+                "phone": normalize_phone(request_body.phone),
+            },
+        )
     return execute_agent_text(
         user_text=request_body.text.strip(),
         confirm=request_body.confirm,
@@ -834,12 +886,26 @@ async def transcribe_and_agent(
         )
     content = await audio.read()
     text = run_transcription(content, extension)
+    if DEBUG_PAYLOADS:
+        logger.info(
+            "transcribe-and-agent transcription (preview)",
+            extra={"text_preview": (text or "")[:300], "confirm": confirm, "phone": normalize_phone(phone)},
+        )
     agent_result = execute_agent_text(
         user_text=text,
         confirm=confirm,
         model_name=OLLAMA_MODEL,
         phone=phone,
     )
+    if DEBUG_PAYLOADS:
+        logger.info(
+            "transcribe-and-agent agent_result (preview)",
+            extra={
+                "ok": agent_result.get("ok"),
+                "action": agent_result.get("action"),
+                "message_preview": (agent_result.get("message") or "")[:200],
+            },
+        )
     logger.info(
         "Fluxo transcribe-and-agent concluido",
         extra={"ok": agent_result.get("ok"), "action": agent_result.get("action")},
