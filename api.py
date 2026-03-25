@@ -1,0 +1,674 @@
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+import json
+import logging
+import os
+import time
+import unicodedata
+from urllib import error, request
+
+import psycopg
+import whisper
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+from psycopg.rows import dict_row
+
+load_dotenv()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("finance_api")
+
+
+MODEL_NAME = "base"
+OLLAMA_MODEL = "llama3.2:3b"
+ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
+INCOME_CATEGORIES = {
+    "salario",
+    "freelance",
+    "investimentos",
+    "vendas",
+    "reembolso",
+    "bonus",
+    "outros_receitas",
+}
+EXPENSE_CATEGORIES = {
+    "alimentacao",
+    "moradia",
+    "transporte",
+    "saude",
+    "educacao",
+    "lazer",
+    "impostos",
+    "assinaturas",
+    "contas",
+    "compras",
+    "outros_gastos",
+}
+
+app = FastAPI(title="Finance Whisper Agent API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+model = whisper.load_model(MODEL_NAME)
+
+
+class FinanceCreate(BaseModel):
+    amount: float = Field(..., gt=0)
+    category: str = Field(..., min_length=1)
+    description: str = ""
+    occurred_on: str | None = None
+    phone: str | None = None
+
+
+class AgentExecuteRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    confirm: bool = False
+    model: str | None = None
+    phone: str | None = None
+
+
+def get_database_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        logger.error("DATABASE_URL nao configurada.")
+        raise HTTPException(
+            status_code=500,
+            detail="DATABASE_URL nao configurada no ambiente.",
+        )
+    return url
+
+
+def get_conn() -> psycopg.Connection:
+    return psycopg.connect(get_database_url(), row_factory=dict_row)
+
+
+def init_db() -> None:
+    logger.info("Inicializando estrutura de banco...")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                phone TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMP NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_phone TEXT")
+        conn.execute("UPDATE transactions SET user_phone = 'anonimo' WHERE user_phone IS NULL")
+        conn.execute("ALTER TABLE transactions ALTER COLUMN user_phone SET NOT NULL")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_transactions_user_phone ON transactions(user_phone)"
+        )
+    logger.info("Banco inicializado com sucesso.")
+
+
+def normalize_phone(phone: str | None) -> str:
+    if not phone:
+        return "anonimo"
+    digits = "".join(char for char in phone if char.isdigit())
+    return digits or "anonimo"
+
+
+def ensure_user(phone: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (phone)
+            VALUES (%s)
+            ON CONFLICT (phone) DO NOTHING
+            """,
+            [phone],
+        )
+
+
+def normalize_date(occurred_on: str | None) -> str:
+    if not occurred_on:
+        return date.today().isoformat()
+    try:
+        return datetime.strptime(occurred_on, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Data invalida. Use YYYY-MM-DD.") from exc
+
+
+def normalize_category(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.strip().lower().replace("-", "_").replace(" ", "_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized
+
+
+def sanitize_category_candidate(raw_value: str) -> str:
+    value = raw_value.strip()
+    if "'" in value:
+        parts = [part for part in value.split("'") if part.strip()]
+        if parts:
+            value = parts[-1].strip()
+    if '"' in value:
+        parts = [part for part in value.split('"') if part.strip()]
+        if parts:
+            value = parts[-1].strip()
+    return normalize_category(value)
+
+
+def validate_category(kind: str, category: str) -> str:
+    normalized = sanitize_category_candidate(category)
+    allowed = INCOME_CATEGORIES if kind == "income" else EXPENSE_CATEGORIES
+    if normalized not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Categoria invalida para {kind}: '{category}'. "
+                f"Categorias permitidas: {', '.join(sorted(allowed))}"
+            ),
+        )
+    return normalized
+
+
+def add_transaction(kind: str, data: FinanceCreate) -> dict:
+    logger.info("Criando transacao", extra={"kind": kind, "phone": normalize_phone(data.phone)})
+    occ_date = normalize_date(data.occurred_on)
+    category = validate_category(kind, data.category)
+    user_phone = normalize_phone(data.phone)
+    ensure_user(user_phone)
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO transactions (kind, amount, category, description, occurred_on, created_at, user_phone)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, kind, amount, category, description, occurred_on, user_phone
+            """,
+            [
+                kind,
+                float(data.amount),
+                category,
+                data.description.strip(),
+                occ_date,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                user_phone,
+            ],
+        ).fetchone()
+        if not row:
+            logger.error("Falha ao inserir transacao.")
+            raise HTTPException(status_code=500, detail="Falha ao criar transacao.")
+        created = serialize_transaction(row)
+        logger.info("Transacao criada", extra={"id": created["id"], "kind": created["kind"]})
+        return created
+
+
+def remove_transaction(transaction_id: int, phone: str | None = None) -> bool:
+    user_phone = normalize_phone(phone) if phone else None
+    logger.info(
+        "Removendo transacao",
+        extra={"transaction_id": transaction_id, "phone": user_phone or "all"},
+    )
+    with get_conn() as conn:
+        if user_phone:
+            cursor = conn.execute(
+                "DELETE FROM transactions WHERE id = %s AND user_phone = %s",
+                [transaction_id, user_phone],
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM transactions WHERE id = %s",
+                [transaction_id],
+            )
+        return cursor.rowcount > 0
+
+
+def get_period_bounds(period: str, ref_date: date) -> tuple[date, date]:
+    if period == "day":
+        return ref_date, ref_date
+    if period == "week":
+        start = ref_date - timedelta(days=ref_date.weekday())
+        end = start + timedelta(days=6)
+        return start, end
+    if period == "month":
+        start = ref_date.replace(day=1)
+        if start.month == 12:
+            next_month = start.replace(year=start.year + 1, month=1, day=1)
+        else:
+            next_month = start.replace(month=start.month + 1, day=1)
+        end = next_month - timedelta(days=1)
+        return start, end
+    raise HTTPException(status_code=400, detail="Periodo invalido. Use day, week ou month.")
+
+
+def resolve_report_kind(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = normalize_category(value)
+    if normalized in {"expense", "expenses", "gasto", "gastos", "despesa", "despesas"}:
+        return "expense"
+    if normalized in {"income", "incomes", "receita", "receitas", "ganho", "ganhos"}:
+        return "income"
+    if normalized in {"all", "todos", "todas"}:
+        return None
+    raise HTTPException(
+        status_code=400,
+        detail="Filtro de tipo invalido. Use income, expense ou all.",
+    )
+
+
+def infer_report_kind_from_text(user_text: str) -> str | None:
+    normalized = normalize_category(user_text)
+    if any(token in normalized for token in ["gasto", "gastos", "despesa", "despesas"]):
+        return "expense"
+    if any(token in normalized for token in ["receita", "receitas", "ganho", "ganhos"]):
+        return "income"
+    return None
+
+
+def build_report(
+    period: str,
+    reference_date: str | None,
+    kind: str | None = None,
+    phone: str | None = None,
+) -> dict:
+    logger.info(
+        "Gerando relatorio",
+        extra={"period": period, "kind": kind or "all", "phone": normalize_phone(phone) if phone else "all"},
+    )
+    ref = date.today() if not reference_date else normalize_date(reference_date)
+    if isinstance(ref, str):
+        ref = datetime.strptime(ref, "%Y-%m-%d").date()
+    start, end = get_period_bounds(period, ref)
+
+    where_kind = ""
+    where_phone = ""
+    params: list[str]
+    if kind:
+        where_kind = " AND kind = %s"
+        params = [start.isoformat(), end.isoformat(), kind]
+    else:
+        params = [start.isoformat(), end.isoformat()]
+    if phone:
+        where_phone = " AND user_phone = %s"
+        params.append(normalize_phone(phone))
+
+    with get_conn() as conn:
+        query = f"""
+            SELECT id, kind, amount, category, description, occurred_on, user_phone
+            FROM transactions
+            WHERE occurred_on >= %s AND occurred_on <= %s
+            {where_kind}
+            {where_phone}
+            ORDER BY occurred_on DESC, id DESC
+            """
+        rows = conn.execute(
+            query,
+            params,
+        ).fetchall()
+
+    items = [serialize_transaction(row) for row in rows]
+    total_income = sum(item["amount"] for item in items if item["kind"] == "income")
+    total_expense = sum(item["amount"] for item in items if item["kind"] == "expense")
+    balance = total_income - total_expense
+
+    return {
+        "period": period,
+        "kind_filter": kind or "all",
+        "phone_filter": normalize_phone(phone) if phone else "all",
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "total_income": round(total_income, 2),
+        "total_expense": round(total_expense, 2),
+        "balance": round(balance, 2),
+        "transactions": items,
+    }
+
+
+def serialize_transaction(row: dict) -> dict:
+    occurred_on = row["occurred_on"]
+    return {
+        "id": int(row["id"]),
+        "kind": row["kind"],
+        "amount": float(row["amount"]),
+        "category": row["category"],
+        "description": row["description"] or "",
+        "occurred_on": occurred_on.isoformat() if hasattr(occurred_on, "isoformat") else str(occurred_on),
+        "phone": row.get("user_phone"),
+    }
+
+
+def run_transcription(audio_bytes: bytes, suffix: str) -> str:
+    temp_path = None
+    try:
+        with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_path = temp_file.name
+        result = model.transcribe(temp_path, language="pt")
+        return result.get("text", "").strip()
+    finally:
+        if temp_path:
+            Path(temp_path).unlink(missing_ok=True)
+
+
+def run_ollama(messages: list[dict], model_name: str) -> str:
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": 0.1},
+    }
+    req = request.Request(
+        url="http://127.0.0.1:11434/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=120) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return (body.get("message", {}) or {}).get("content", "").strip()
+    except error.URLError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Nao foi possivel conectar no Ollama local. "
+                "Execute `ollama serve` e `ollama pull llama3.2:3b`."
+            ),
+        ) from exc
+
+
+def parse_agent_plan(raw: str) -> dict:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.replace("json\n", "", 1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Resposta do agente nao veio em JSON valido: {raw}",
+        ) from exc
+
+
+def build_agent_plan(user_text: str, model_name: str) -> dict:
+    logger.info("Gerando plano do agente", extra={"model": model_name})
+    system = """
+Voce eh um roteador de acoes financeiras.
+Responda SOMENTE JSON valido no formato:
+{
+  "action": "add_income|add_expense|remove_transaction|get_report|clarify",
+  "arguments": {
+    "amount": number|null,
+    "category": string|null,
+    "description": string|null,
+    "occurred_on": "YYYY-MM-DD"|null,
+    "transaction_id": integer|null,
+    "period": "day|week|month"|null,
+    "report_kind": "income|expense|all"|null
+  },
+  "message": "frase curta em portugues",
+  "requires_confirmation": boolean
+}
+Use "clarify" quando faltar dado essencial.
+Categorias permitidas para receita (add_income):
+salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas
+Categorias permitidas para despesa (add_expense):
+alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos
+Sempre retorne category em um desses valores exatos.
+Nunca invente categoria, nunca responda texto livre em "category".
+Se nao for possivel classificar com seguranca em uma categoria permitida, use action="clarify".
+"""
+    raw = run_ollama(
+        messages=[
+            {"role": "system", "content": system.strip()},
+            {"role": "user", "content": user_text},
+        ],
+        model_name=model_name,
+    )
+    return parse_agent_plan(raw)
+
+
+def execute_agent_text(
+    user_text: str, confirm: bool, model_name: str, phone: str | None = None
+) -> dict:
+    start = time.perf_counter()
+    logger.info(
+        "Executando agente",
+        extra={
+            "phone": normalize_phone(phone),
+            "confirm": confirm,
+            "text_preview": user_text[:120],
+        },
+    )
+    plan = build_agent_plan(user_text, model_name)
+    action = (plan.get("action") or "").strip()
+    args = plan.get("arguments") or {}
+    message = (plan.get("message") or "").strip() or "Acao processada."
+    requires_confirmation = bool(plan.get("requires_confirmation"))
+
+    if action == "clarify":
+        logger.info("Agente pediu esclarecimento.")
+        return {"ok": False, "action": action, "message": message, "needs_input": True}
+
+    if action in {"add_income", "add_expense"}:
+        amount = args.get("amount")
+        category = args.get("category")
+        if amount is None or not category:
+            return {
+                "ok": False,
+                "action": "clarify",
+                "message": "Faltou informar valor e categoria para lancar.",
+                "needs_input": True,
+            }
+        payload = FinanceCreate(
+            amount=float(amount),
+            category=str(category),
+            description=str(args.get("description") or ""),
+            occurred_on=args.get("occurred_on"),
+            phone=phone,
+        )
+        kind = "income" if action == "add_income" else "expense"
+        cleaned_category = sanitize_category_candidate(payload.category)
+        allowed = INCOME_CATEGORIES if kind == "income" else EXPENSE_CATEGORIES
+        if cleaned_category not in allowed:
+            return {
+                "ok": False,
+                "action": "clarify",
+                "message": (
+                    "Categoria nao permitida. Escolha uma das categorias validas: "
+                    + ", ".join(sorted(allowed))
+                ),
+                "needs_input": True,
+                "allowed_categories": sorted(allowed),
+            }
+        payload.category = cleaned_category
+        created = add_transaction(kind, payload)
+        logger.info("Acao add executada", extra={"action": action, "elapsed_ms": int((time.perf_counter() - start) * 1000)})
+        return {"ok": True, "action": action, "message": message, "data": created}
+
+    if action == "remove_transaction":
+        tx_id = args.get("transaction_id")
+        if tx_id is None:
+            return {
+                "ok": False,
+                "action": "clarify",
+                "message": "Informe o ID da transacao que deseja remover.",
+                "needs_input": True,
+            }
+        if requires_confirmation and not confirm:
+            return {
+                "ok": False,
+                "action": action,
+                "message": "Confirme a remocao enviando confirm=true.",
+                "needs_confirmation": True,
+                "arguments": {"transaction_id": tx_id},
+            }
+        deleted = remove_transaction(int(tx_id), phone=phone)
+        if not deleted:
+            logger.warning("Transacao nao encontrada para remocao", extra={"transaction_id": tx_id})
+            return {
+                "ok": False,
+                "action": action,
+                "message": f"Transacao {tx_id} nao encontrada.",
+            }
+        logger.info("Transacao removida", extra={"transaction_id": tx_id})
+        return {
+            "ok": True,
+            "action": action,
+            "message": message or f"Transacao {tx_id} removida.",
+            "data": {"transaction_id": int(tx_id)},
+        }
+
+    if action == "get_report":
+        period = str(args.get("period") or "month")
+        report_kind = resolve_report_kind(args.get("report_kind"))
+        if report_kind is None:
+            report_kind = infer_report_kind_from_text(user_text)
+        report = build_report(
+            period=period,
+            reference_date=args.get("occurred_on"),
+            kind=report_kind,
+            phone=phone,
+        )
+        logger.info("Relatorio gerado", extra={"elapsed_ms": int((time.perf_counter() - start) * 1000)})
+        return {"ok": True, "action": action, "message": message, "data": report}
+
+    return {
+        "ok": False,
+        "action": "clarify",
+        "message": "Nao consegui identificar a acao. Pode reformular?",
+        "needs_input": True,
+    }
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    init_db()
+    logger.info("API pronta para receber requisicoes.")
+
+
+@app.get("/")
+def read_index() -> FileResponse:
+    return FileResponse("static/index.html")
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)) -> dict:
+    logger.info("Requisicao /api/transcribe recebida", extra={"audio_name": audio.filename})
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="Arquivo de audio sem nome.")
+    extension = Path(audio.filename).suffix.lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Formato nao suportado: " + ", ".join(sorted(ALLOWED_EXTENSIONS)),
+        )
+    content = await audio.read()
+    text = run_transcription(content, extension)
+    logger.info("Transcricao concluida", extra={"chars": len(text)})
+    return {"text": text}
+
+
+@app.post("/api/finance/income")
+def create_income(payload: FinanceCreate) -> dict:
+    logger.info("Endpoint /api/finance/income", extra={"phone": normalize_phone(payload.phone)})
+    return {"ok": True, "data": add_transaction("income", payload)}
+
+
+@app.post("/api/finance/expense")
+def create_expense(payload: FinanceCreate) -> dict:
+    logger.info("Endpoint /api/finance/expense", extra={"phone": normalize_phone(payload.phone)})
+    return {"ok": True, "data": add_transaction("expense", payload)}
+
+
+@app.delete("/api/finance/transaction/{transaction_id}")
+def delete_transaction(transaction_id: int, phone: str | None = None) -> dict:
+    logger.info("Endpoint delete transaction", extra={"transaction_id": transaction_id, "phone": normalize_phone(phone)})
+    deleted = remove_transaction(transaction_id, phone=phone)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Transacao nao encontrada.")
+    return {"ok": True, "transaction_id": transaction_id}
+
+
+@app.get("/api/finance/report")
+def finance_report(
+    period: str = Query("month", pattern="^(day|week|month)$"),
+    reference_date: str | None = None,
+    kind: str = Query("all", pattern="^(all|income|expense)$"),
+    phone: str | None = None,
+) -> dict:
+    logger.info(
+        "Endpoint /api/finance/report",
+        extra={"period": period, "kind": kind, "phone": normalize_phone(phone)},
+    )
+    kind_filter = None if kind == "all" else kind
+    return {
+        "ok": True,
+        "data": build_report(
+            period=period,
+            reference_date=reference_date,
+            kind=kind_filter,
+            phone=phone,
+        ),
+    }
+
+
+@app.get("/api/finance/categories")
+def finance_categories() -> dict:
+    return {
+        "ok": True,
+        "income_categories": sorted(INCOME_CATEGORIES),
+        "expense_categories": sorted(EXPENSE_CATEGORIES),
+    }
+
+
+@app.post("/api/agent/execute")
+def agent_execute(request_body: AgentExecuteRequest) -> dict:
+    logger.info("Endpoint /api/agent/execute", extra={"phone": normalize_phone(request_body.phone)})
+    return execute_agent_text(
+        user_text=request_body.text.strip(),
+        confirm=request_body.confirm,
+        model_name=request_body.model or OLLAMA_MODEL,
+        phone=request_body.phone,
+    )
+
+
+@app.post("/api/transcribe-and-agent")
+async def transcribe_and_agent(
+    audio: UploadFile = File(...),
+    confirm: bool = Form(False),
+    phone: str | None = Form(None),
+) -> dict:
+    logger.info(
+        "Endpoint /api/transcribe-and-agent",
+        extra={"audio_name": audio.filename, "phone": normalize_phone(phone)},
+    )
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="Arquivo de audio sem nome.")
+    extension = Path(audio.filename).suffix.lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Formato nao suportado: " + ", ".join(sorted(ALLOWED_EXTENSIONS)),
+        )
+    content = await audio.read()
+    text = run_transcription(content, extension)
+    agent_result = execute_agent_text(
+        user_text=text,
+        confirm=confirm,
+        model_name=OLLAMA_MODEL,
+        phone=phone,
+    )
+    logger.info(
+        "Fluxo transcribe-and-agent concluido",
+        extra={"ok": agent_result.get("ok"), "action": agent_result.get("action")},
+    )
+    return {"transcription": text, "agent_result": agent_result}

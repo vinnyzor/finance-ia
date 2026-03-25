@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Whisper + IA</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #111827;
+      color: #f9fafb;
+      margin: 0;
+      padding: 24px;
+    }
+    .card {
+      max-width: 700px;
+      margin: 0 auto;
+      background: #1f2937;
+      border-radius: 12px;
+      padding: 20px;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 24px;
+    }
+    button, input[type="file"] {
+      margin-top: 10px;
+    }
+    button {
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #2563eb;
+      color: #fff;
+      margin-right: 8px;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .status {
+      margin-top: 12px;
+      color: #93c5fd;
+    }
+    textarea {
+      width: 100%;
+      min-height: 140px;
+      margin-top: 14px;
+      border-radius: 8px;
+      border: 1px solid #374151;
+      padding: 10px;
+      background: #0b1220;
+      color: #f9fafb;
+      resize: vertical;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Whisper + IA</h1>
+    <p>Grave ou envie audio. A IA local interpreta e executa a acao financeira correta.</p>
+
+    <div>
+      <button id="startRecord">Iniciar gravacao</button>
+      <button id="stopRecord" disabled>Parar gravacao</button>
+      <button id="sendRecord" disabled>Enviar gravacao</button>
+    </div>
+
+    <hr />
+
+    <label for="audioFile">Ou selecione um arquivo de audio:</label><br />
+    <input id="audioFile" type="file" accept=".wav,.mp3,.m4a,.ogg,.webm,.flac,audio/*" />
+    <button id="sendFile">Enviar arquivo</button>
+
+    <div style="margin-top: 12px;">
+      <button id="runAgent">Executar agente com transcricao</button>
+    </div>
+
+    <hr />
+    <label for="commandText">Ou digite um comando financeiro:</label>
+    <textarea id="commandText" placeholder="Ex: adicionar despesa de 120 em alimentacao hoje"></textarea>
+    <button id="runTextAgent">Executar agente por texto</button>
+
+    <div class="status" id="status"></div>
+    <textarea id="result" placeholder="Texto transcrito aparece aqui..."></textarea>
+    <textarea id="agentResult" placeholder="Resultado do agente aparece aqui..."></textarea>
+  </div>
+
+  <script>
+    const startBtn = document.getElementById("startRecord");
+    const stopBtn = document.getElementById("stopRecord");
+    const sendRecordBtn = document.getElementById("sendRecord");
+    const sendFileBtn = document.getElementById("sendFile");
+    const audioFileInput = document.getElementById("audioFile");
+    const runAgentBtn = document.getElementById("runAgent");
+    const runTextAgentBtn = document.getElementById("runTextAgent");
+    const commandTextEl = document.getElementById("commandText");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const agentResultEl = document.getElementById("agentResult");
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let recordedBlob = null;
+
+    const setStatus = (text) => {
+      statusEl.textContent = text;
+    };
+
+    async function sendAudioBlob(blob, filename = "audio.webm") {
+      const formData = new FormData();
+      formData.append("audio", blob, filename);
+
+      setStatus("Enviando audio para transcricao...");
+      resultEl.value = "";
+      agentResultEl.value = "";
+
+      try {
+        const response = await fetch("/api/transcribe", {
+          method: "POST",
+          body: formData
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.detail || "Falha na requisicao");
+        }
+
+        resultEl.value = data.text || "";
+        setStatus("Transcricao concluida.");
+      } catch (error) {
+        setStatus("Erro: " + error.message);
+      }
+    }
+
+    async function runAgentWithText(text) {
+      if (!text || !text.trim()) {
+        setStatus("Nao ha transcricao para enviar para a IA.");
+        return;
+      }
+
+      setStatus("Executando IA...");
+      agentResultEl.value = "";
+
+      try {
+        const response = await fetch("/api/agent/execute", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: text,
+            model: "llama3.2:3b"
+          })
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.detail || "Falha ao executar IA");
+        }
+
+        agentResultEl.value = JSON.stringify(data, null, 2);
+        setStatus("Agente concluido.");
+      } catch (error) {
+        setStatus("Erro IA: " + error.message);
+      }
+    }
+
+    startBtn.addEventListener("click", async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstop = () => {
+          recordedBlob = new Blob(audioChunks, { type: "audio/webm" });
+          sendRecordBtn.disabled = false;
+          setStatus("Gravacao pronta para envio.");
+          stream.getTracks().forEach((track) => track.stop());
+        };
+
+        mediaRecorder.start();
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        sendRecordBtn.disabled = true;
+        setStatus("Gravando...");
+      } catch (error) {
+        setStatus("Erro ao acessar microfone: " + error.message);
+      }
+    });
+
+    stopBtn.addEventListener("click", () => {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+    });
+
+    sendRecordBtn.addEventListener("click", async () => {
+      if (!recordedBlob) {
+        setStatus("Nenhuma gravacao disponivel.");
+        return;
+      }
+      await sendAudioBlob(recordedBlob, "gravacao.webm");
+    });
+
+    sendFileBtn.addEventListener("click", async () => {
+      const file = audioFileInput.files[0];
+      if (!file) {
+        setStatus("Selecione um arquivo de audio primeiro.");
+        return;
+      }
+      await sendAudioBlob(file, file.name);
+    });
+
+    runAgentBtn.addEventListener("click", async () => {
+      await runAgentWithText(resultEl.value);
+    });
+
+    runTextAgentBtn.addEventListener("click", async () => {
+      await runAgentWithText(commandTextEl.value);
+    });
+  </script>
+</body>
+</html>

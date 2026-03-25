@@ -1,0 +1,9 @@
+openai-whisper
+sounddevice
+soundfile
+numpy
+fastapi
+uvicorn
+python-multipart
+psycopg[binary]
+python-dotenv
