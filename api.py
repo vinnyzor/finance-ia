@@ -4,6 +4,7 @@ from tempfile import NamedTemporaryFile
 import json
 import logging
 import os
+import socket
 import time
 import unicodedata
 from urllib import error, request
@@ -32,7 +33,7 @@ OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "140"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "1024"))
 OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "4"))
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
 INCOME_CATEGORIES = {
@@ -387,6 +388,24 @@ def run_ollama(messages: list[dict], model_name: str) -> str:
         with request.urlopen(req, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read().decode("utf-8"))
             return (body.get("message", {}) or {}).get("content", "").strip()
+    except TimeoutError as exc:
+        logger.exception("Timeout ao chamar Ollama")
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Ollama demorou mais que {OLLAMA_TIMEOUT_SECONDS}s. "
+                "Aumente OLLAMA_TIMEOUT_SECONDS no .env, use modelo menor, ou reduza OLLAMA_NUM_PREDICT/OLLAMA_NUM_CTX."
+            ),
+        ) from exc
+    except socket.timeout as exc:
+        logger.exception("Timeout (socket) ao chamar Ollama")
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Ollama demorou mais que {OLLAMA_TIMEOUT_SECONDS}s. "
+                "Aumente OLLAMA_TIMEOUT_SECONDS no .env, use modelo menor, ou reduza OLLAMA_NUM_PREDICT/OLLAMA_NUM_CTX."
+            ),
+        ) from exc
     except error.URLError as exc:
         raise HTTPException(
             status_code=500,
