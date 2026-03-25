@@ -377,6 +377,14 @@ def run_transcription(audio_bytes: bytes, suffix: str) -> str:
 
 def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -> str:
     started_at = time.perf_counter()
+    logger.info(
+        "Chamando Ollama",
+        extra={
+            "model": model_name,
+            "stream_mode": OLLAMA_DEBUG_STREAM,
+            "json_mode": json_mode,
+        },
+    )
     payload = {
         "model": model_name,
         "messages": messages,
