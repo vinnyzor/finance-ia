@@ -69,7 +69,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model = whisper.load_model(MODEL_NAME)
+_whisper_model = None
+
+
+def get_whisper_model():
+    """Carrega Whisper sob demanda para nao competir por RAM com Ollama em /api/agent/execute."""
+    global _whisper_model
+    if _whisper_model is None:
+        logger.info("Carregando Whisper (primeira transcricao)...", extra={"whisper_model": MODEL_NAME})
+        _whisper_model = whisper.load_model(MODEL_NAME)
+    return _whisper_model
 
 
 class FinanceCreate(BaseModel):
@@ -358,7 +367,7 @@ def run_transcription(audio_bytes: bytes, suffix: str) -> str:
         with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
             temp_file.write(audio_bytes)
             temp_path = temp_file.name
-        result = model.transcribe(temp_path, language="pt")
+        result = get_whisper_model().transcribe(temp_path, language="pt")
         return result.get("text", "").strip()
     finally:
         if temp_path:
@@ -584,7 +593,7 @@ def execute_agent_text(
 @app.on_event("startup")
 def startup_event() -> None:
     logger.info(
-        "Modelos carregados",
+        "API iniciada (Whisper carrega na primeira transcricao)",
         extra={
             "whisper_model": MODEL_NAME,
             "ollama_model": OLLAMA_MODEL,
