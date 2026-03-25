@@ -30,10 +30,10 @@ logger = logging.getLogger("finance_api")
 MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.0"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "48"))
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "256"))
-OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "2"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "140"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "1024"))
+OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "4"))
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 OLLAMA_DEBUG_STREAM = os.getenv("OLLAMA_DEBUG_STREAM", "false").lower() == "true"
@@ -168,6 +168,27 @@ def normalize_category(value: str) -> str:
     normalized = normalized.strip().lower().replace("-", "_").replace(" ", "_")
     while "__" in normalized:
         normalized = normalized.replace("__", "_")
+    # Normalizacoes de singular/plural comuns retornados por LLMs.
+    # Ex.: "compra" -> "compras", "conta" -> "contas", etc.
+    aliases = {
+        "compra": "compras",
+        "assinatura": "assinaturas",
+        "conta": "contas",
+        "imposto": "impostos",
+        "outro_gasto": "outros_gastos",
+        "outros_gasto": "outros_gastos",
+        # Sinonimos comuns (para caber nas categorias permitidas).
+        "gasolina": "transporte",
+        "combustivel": "transporte",
+        "posto": "transporte",
+        "uber": "transporte",
+        "99": "transporte",
+        "taxi": "transporte",
+        "pedagio": "transporte",
+        "ifood": "alimentacao",
+        "i_food": "alimentacao",
+    }
+    normalized = aliases.get(normalized, normalized)
     return normalized
 
 
@@ -569,10 +590,57 @@ def coerce_agent_plan(plan: dict) -> dict:
             "requires_confirmation": False,
         }
 
+    def get_nested(obj: dict, key: str):
+        if not isinstance(obj, dict):
+            return None
+        return obj.get(key)
+
+    def extract_amount(source: dict) -> float | None:
+        if not isinstance(source, dict):
+            return None
+        candidates = [
+            source.get("amount"),
+            source.get("valor"),
+            source.get("valor_compra"),
+            source.get("valor_gasto"),
+            source.get("valor_despesa"),
+            source.get("valor_receita"),
+            source.get("valor_income"),
+        ]
+        for v in candidates:
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def extract_category(source: dict) -> str | None:
+        if not isinstance(source, dict):
+            return None
+        candidates = [
+            source.get("category"),
+            source.get("categoria"),
+            source.get("tipo"),
+            source.get("categoria_compra"),
+            source.get("categoria_gasto"),
+            source.get("categoria_despesa"),
+            source.get("tipo_gasto"),
+            source.get("categoria_receita"),
+            source.get("tipo_receita"),
+        ]
+        for v in candidates:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        return None
+
     # Mapeia respostas comuns de modelos menores para o schema esperado.
     if "action" not in plan:
-        category = str(plan.get("categoria") or plan.get("category") or "").lower()
-        amount = plan.get("valor") if "valor" in plan else plan.get("amount")
+        amount = extract_amount(plan)
         inferred_action = "clarify"
         if amount is not None:
             inferred_action = "add_expense"
@@ -583,7 +651,7 @@ def coerce_agent_plan(plan: dict) -> dict:
             "action": inferred_action,
             "arguments": {
                 "amount": amount,
-                "category": category or None,
+                "category": extract_category(plan),
                 "description": plan.get("descricao") or plan.get("description"),
                 "occurred_on": plan.get("data") or plan.get("occurred_on"),
                 "transaction_id": plan.get("transaction_id"),
@@ -594,7 +662,33 @@ def coerce_agent_plan(plan: dict) -> dict:
             "requires_confirmation": bool(plan.get("requires_confirmation", False)),
         }
 
-    plan.setdefault("arguments", {})
+    # Se a IA retornou action mas nao retornou arguments completos,
+    # tenta reconstruir amount/category a partir de chaves alternativas.
+    if "arguments" not in plan or not isinstance(plan.get("arguments"), dict):
+        plan["arguments"] = {}
+    args = plan["arguments"]
+
+    # tenta extrair de "data"/"arguments" caso existam
+    data_obj = get_nested(plan, "data") or {}
+    if isinstance(data_obj, dict):
+        # algumas respostas trazem os campos dentro de data
+        if args.get("amount") is None:
+            args["amount"] = extract_amount(data_obj) or extract_amount(plan)
+        if not args.get("category"):
+            args["category"] = extract_category(data_obj) or extract_category(plan)
+    else:
+        if args.get("amount") is None:
+            args["amount"] = extract_amount(plan)
+        if not args.get("category"):
+            args["category"] = extract_category(plan)
+
+    # também tenta dentro do próprio args se vier com chaves diferentes
+    if args.get("amount") is None:
+        args["amount"] = extract_amount(args)
+    if not args.get("category"):
+        args["category"] = extract_category(args)
+
+    plan["arguments"] = args
     plan.setdefault("message", "Acao processada.")
     plan.setdefault("requires_confirmation", False)
     return plan
