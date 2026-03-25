@@ -35,6 +35,7 @@ OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "256"))
 OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "2"))
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
+OLLAMA_DEBUG_STREAM = os.getenv("OLLAMA_DEBUG_STREAM", "false").lower() == "true"
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac"}
 INCOME_CATEGORIES = {
     "salario",
@@ -375,10 +376,11 @@ def run_transcription(audio_bytes: bytes, suffix: str) -> str:
 
 
 def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -> str:
+    started_at = time.perf_counter()
     payload = {
         "model": model_name,
         "messages": messages,
-        "stream": False,
+        "stream": OLLAMA_DEBUG_STREAM,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": OLLAMA_TEMPERATURE,
@@ -397,7 +399,54 @@ def run_ollama(messages: list[dict], model_name: str, json_mode: bool = False) -
     )
     try:
         with request.urlopen(req, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+            if OLLAMA_DEBUG_STREAM:
+                chunks: list[str] = []
+                chunk_count = 0
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    part = json.loads(line)
+                    piece = (part.get("message", {}) or {}).get("content", "")
+                    if piece:
+                        chunks.append(piece)
+                        chunk_count += 1
+                        if chunk_count % 10 == 0:
+                            logger.info(
+                                "Ollama stream parcial",
+                                extra={
+                                    "chunks": chunk_count,
+                                    "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                                },
+                            )
+                    if part.get("done"):
+                        logger.info(
+                            "Ollama stream finalizado",
+                            extra={
+                                "model": model_name,
+                                "chunks": chunk_count,
+                                "total_duration_ns": part.get("total_duration"),
+                                "eval_duration_ns": part.get("eval_duration"),
+                                "prompt_eval_count": part.get("prompt_eval_count"),
+                                "eval_count": part.get("eval_count"),
+                                "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                            },
+                        )
+                        break
+                return "".join(chunks).strip()
+
             body = json.loads(response.read().decode("utf-8"))
+            logger.info(
+                "Ollama resposta recebida",
+                extra={
+                    "model": model_name,
+                    "total_duration_ns": body.get("total_duration"),
+                    "eval_duration_ns": body.get("eval_duration"),
+                    "prompt_eval_count": body.get("prompt_eval_count"),
+                    "eval_count": body.get("eval_count"),
+                    "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                },
+            )
             return (body.get("message", {}) or {}).get("content", "").strip()
     except TimeoutError as exc:
         logger.exception("Timeout ao chamar Ollama")
@@ -596,6 +645,7 @@ def startup_event() -> None:
             "ollama_num_predict": OLLAMA_NUM_PREDICT,
             "ollama_num_ctx": OLLAMA_NUM_CTX,
             "ollama_num_thread": OLLAMA_NUM_THREAD,
+            "ollama_debug_stream": OLLAMA_DEBUG_STREAM,
         },
     )
     init_db()
