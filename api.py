@@ -9,7 +9,7 @@ import ast
 import time
 import unicodedata
 from urllib import error, request
-
+ 
 import psycopg
 import whisper
 from dotenv import load_dotenv
