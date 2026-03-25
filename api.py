@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import socket
+import ast
 import time
 import unicodedata
 from urllib import error, request
@@ -490,33 +491,96 @@ def parse_agent_plan(raw: str) -> dict:
         text = text.strip("`")
         text = text.replace("json\n", "", 1).strip()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        return coerce_agent_plan(parsed)
     except json.JSONDecodeError as exc:
+        # Fallback para modelos pequenos que respondem com aspas simples
+        # ou com texto extra junto do objeto.
+        repaired = try_parse_lenient_json(text)
+        if repaired is not None:
+            return coerce_agent_plan(repaired)
         raise HTTPException(
             status_code=500,
             detail=f"Resposta do agente nao veio em JSON valido: {raw}",
         ) from exc
 
 
+def try_parse_lenient_json(text: str) -> dict | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = text[start : end + 1]
+    try:
+        value = ast.literal_eval(snippet)
+        return value if isinstance(value, dict) else None
+    except (ValueError, SyntaxError):
+        return None
+
+
+def coerce_agent_plan(plan: dict) -> dict:
+    if not isinstance(plan, dict):
+        return {
+            "action": "clarify",
+            "arguments": {},
+            "message": "Nao entendi bem. Pode reformular em uma frase objetiva?",
+            "requires_confirmation": False,
+        }
+
+    # Mapeia respostas comuns de modelos menores para o schema esperado.
+    if "action" not in plan:
+        category = str(plan.get("categoria") or plan.get("category") or "").lower()
+        amount = plan.get("valor") if "valor" in plan else plan.get("amount")
+        inferred_action = "clarify"
+        if amount is not None:
+            inferred_action = "add_expense"
+        if str(plan.get("tipo") or "").lower() in {"receita", "income"}:
+            inferred_action = "add_income"
+
+        plan = {
+            "action": inferred_action,
+            "arguments": {
+                "amount": amount,
+                "category": category or None,
+                "description": plan.get("descricao") or plan.get("description"),
+                "occurred_on": plan.get("data") or plan.get("occurred_on"),
+                "transaction_id": plan.get("transaction_id"),
+                "period": plan.get("period"),
+                "report_kind": plan.get("report_kind"),
+            },
+            "message": plan.get("message") or "Acao processada.",
+            "requires_confirmation": bool(plan.get("requires_confirmation", False)),
+        }
+
+    plan.setdefault("arguments", {})
+    plan.setdefault("message", "Acao processada.")
+    plan.setdefault("requires_confirmation", False)
+    return plan
+
+
 def build_agent_plan(user_text: str, model_name: str) -> dict:
     logger.info("Gerando plano do agente", extra={"model": model_name})
     system = """
-Responda APENAS JSON valido.
-Campos obrigatorios:
-- action: add_income|add_expense|remove_transaction|get_report|clarify
-- arguments: objeto com amount, category, description, occurred_on, transaction_id, period, report_kind
-- message: frase curta em portugues
-- requires_confirmation: boolean
-
-Regras:
-- Se faltar dado essencial, action="clarify".
-- Periodo permitido: day|week|month.
-- Report kind permitido: income|expense|all.
-- Para add_income, category deve ser uma de:
-  salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas
-- Para add_expense, category deve ser uma de:
-  alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos
-- Nunca invente categoria fora da lista.
+Voce eh um roteador de acoes financeiras.
+Responda APENAS um JSON valido, sem texto fora do JSON.
+Use EXATAMENTE este schema:
+{
+  "action": "add_income|add_expense|remove_transaction|get_report|clarify",
+  "arguments": {
+    "amount": number|null,
+    "category": string|null,
+    "description": string|null,
+    "occurred_on": "YYYY-MM-DD"|null,
+    "transaction_id": integer|null,
+    "period": "day|week|month"|null,
+    "report_kind": "income|expense|all"|null
+  },
+  "message": "frase curta em portugues",
+  "requires_confirmation": boolean
+}
+Categorias receita: salario, freelance, investimentos, vendas, reembolso, bonus, outros_receitas.
+Categorias despesa: alimentacao, moradia, transporte, saude, educacao, lazer, impostos, assinaturas, contas, compras, outros_gastos.
+Se faltar dado essencial, retorne action="clarify".
 """
     raw = run_ollama(
         messages=[
